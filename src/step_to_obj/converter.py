@@ -9,15 +9,17 @@ from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID, TopAbs_SHELL, TopAbs_COMPOUND
+from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID, TopAbs_SHELL, TopAbs_COMPOUND, TopAbs_REVERSED
 from OCP.TopLoc import TopLoc_Location
 from OCP.BRep import BRep_Tool
-from OCP.TopoDS import TopoDS
+from OCP.TopoDS import TopoDS, TopoDS_Iterator
 from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool, XCAFDoc_ColorSurf, XCAFDoc_ColorGen, XCAFDoc_ColorCurv
 from OCP.TDocStd import TDocStd_Document
 from OCP.TCollection import TCollection_ExtendedString
 from OCP.TDF import TDF_LabelSequence
 from OCP.Quantity import Quantity_Color, Quantity_TOC_RGB
+from OCP.GeomLProp import GeomLProp_SLProps
+from OCP.gp import gp_Pnt2d
 
 
 class OutputFormat(Enum):
@@ -90,74 +92,114 @@ def get_label_color(label, color_tool) -> tuple[float, float, float] | None:
     return get_shape_color(shape, color_tool)
 
 
-def extract_mesh_from_shape(shape, color: tuple[float, float, float] | None, name: str) -> MeshPart | None:
-    """Extract mesh data from a single shape."""
-    vertices = []
-    faces = []
-    normals = []
-    current_index = 0
+def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float, float] | None, name_prefix: str) -> list[MeshPart]:
+    """Extract mesh data from a shape, splitting by face colors."""
+    # Map color -> (vertices, faces, normals)
+    # We need to keep vertices separate per color group to avoid complex re-indexing
+    parts_data = {}  # color -> {vertices, faces, normals, current_index}
 
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
 
     while explorer.More():
         topo_face = TopoDS.Face_s(explorer.Current())
+        
+        # Get face color or fallback to parent
+        face_color = get_shape_color(topo_face, color_tool)
+        if face_color is None:
+            face_color = parent_color
+            
+        # Use a key for the dictionary (tuple is hashable)
+        color_key = face_color
+        
+        if color_key not in parts_data:
+            parts_data[color_key] = {
+                "vertices": [],
+                "faces": [],
+                "normals": [],
+                "current_index": 0
+            }
+            
+        data = parts_data[color_key]
+        
+
         location = TopLoc_Location()
         triangulation = BRep_Tool.Triangulation_s(topo_face, location)
 
         if triangulation is not None:
-            transform = location.Transformation()
+            # Prepare properties for smooth normals
+            surface = BRep_Tool.Surface_s(topo_face)
+            has_uv = triangulation.HasUVNodes()
+            face_reversed = topo_face.Orientation() == TopAbs_REVERSED
 
-            face_vertex_start = current_index
+            transform = location.Transformation()
+            
+            # Start index for this face in the current color group
+            face_vertex_start = data["current_index"]
+            
+            # Add vertices and normals
             for i in range(1, triangulation.NbNodes() + 1):
                 node = triangulation.Node(i)
                 transformed = node.Transformed(transform)
                 vertex = (transformed.X(), transformed.Y(), transformed.Z())
-                vertices.append(vertex)
-                current_index += 1
+                data["vertices"].append(vertex)
+                data["current_index"] += 1
+                
+                # Calculate smooth normal if possible
+                normal = (0.0, 0.0, 1.0)
+                if has_uv and surface:
+                    uv = triangulation.UVNode(i)
+                    props = GeomLProp_SLProps(surface, uv.X(), uv.Y(), 1, 1e-5)
+                    if props.IsNormalDefined():
+                        n = props.Normal()
+                        # Apply transformation
+                        n_transformed = n.Transformed(transform) 
+                        
+                        nx, ny, nz = n_transformed.X(), n_transformed.Y(), n_transformed.Z()
+                        
+                        # Flip if face is reversed
+                        if face_reversed:
+                            nx, ny, nz = -nx, -ny, -nz
+                            
+                        length = (nx*nx + ny*ny + nz*nz) ** 0.5
+                        if length > 0:
+                            normal = (nx/length, ny/length, nz/length)
+                
+                data["normals"].append(normal)
 
+            # Add triangles (normals are already per-vertex now)
             for i in range(1, triangulation.NbTriangles() + 1):
                 triangle = triangulation.Triangle(i)
                 n1, n2, n3 = triangle.Get()
 
-                v1 = vertices[face_vertex_start + n1 - 1]
-                v2 = vertices[face_vertex_start + n2 - 1]
-                v3 = vertices[face_vertex_start + n3 - 1]
+                v1_idx = face_vertex_start + n1 - 1
+                v2_idx = face_vertex_start + n2 - 1
+                v3_idx = face_vertex_start + n3 - 1
 
-                edge1 = (v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2])
-                edge2 = (v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2])
-
-                normal = (
-                    edge1[1] * edge2[2] - edge1[2] * edge2[1],
-                    edge1[2] * edge2[0] - edge1[0] * edge2[2],
-                    edge1[0] * edge2[1] - edge1[1] * edge2[0]
-                )
-
-                length = (normal[0]**2 + normal[1]**2 + normal[2]**2) ** 0.5
-                if length > 0:
-                    normal = (normal[0]/length, normal[1]/length, normal[2]/length)
+                # Reverse winding order if face is reversed
+                if face_reversed:
+                    data["faces"].append((v1_idx, v3_idx, v2_idx))
                 else:
-                    normal = (0.0, 0.0, 1.0)
+                    data["faces"].append((v1_idx, v2_idx, v3_idx))
 
-                normals.append(normal)
-
-                faces.append((
-                    face_vertex_start + n1 - 1,
-                    face_vertex_start + n2 - 1,
-                    face_vertex_start + n3 - 1
-                ))
 
         explorer.Next()
 
-    if not vertices:
-        return None
+    result_parts = []
+    for i, (color, data) in enumerate(parts_data.items()):
+        if not data["vertices"]:
+            continue
+            
+        part_name = f"{name_prefix}_{i}" if len(parts_data) > 1 else name_prefix
+        
+        result_parts.append(MeshPart(
+            name=part_name,
+            vertices=data["vertices"],
+            faces=data["faces"],
+            normals=data["normals"],
+            color=color
+        ))
 
-    return MeshPart(
-        name=name,
-        vertices=vertices,
-        faces=faces,
-        normals=normals,
-        color=color
-    )
+    return result_parts
 
 
 def process_shape_recursive(shape, color_tool, shape_tool, parts: list[MeshPart], parent_color=None, name_prefix="Part"):
@@ -169,11 +211,10 @@ def process_shape_recursive(shape, color_tool, shape_tool, parts: list[MeshPart]
 
     shape_type = shape.ShapeType()
 
-    if shape_type in [TopAbs_SOLID, TopAbs_SHELL]:
-        # This is a solid/shell - extract mesh
-        part = extract_mesh_from_shape(shape, color, f"{name_prefix}_{len(parts)}")
-        if part:
-            parts.append(part)
+    if shape_type in [TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE]:
+        # This is a solid/shell/face - extract mesh (now handles multiple colors)
+        new_parts = extract_meshes_by_color(shape, color_tool, color, f"{name_prefix}_{len(parts)}")
+        parts.extend(new_parts)
     elif shape_type == TopAbs_COMPOUND:
         # Compound - iterate children
         from OCP.TopoDS import TopoDS_Iterator
@@ -186,9 +227,8 @@ def process_shape_recursive(shape, color_tool, shape_tool, parts: list[MeshPart]
             idx += 1
     else:
         # Try to extract mesh anyway
-        part = extract_mesh_from_shape(shape, color, f"{name_prefix}_{len(parts)}")
-        if part:
-            parts.append(part)
+        new_parts = extract_meshes_by_color(shape, color_tool, color, f"{name_prefix}_{len(parts)}")
+        parts.extend(new_parts)
 
 
 def extract_all_meshes(doc, shape_tool, color_tool, linear_deflection: float = 1.0, angular_deflection: float = 0.1) -> list[MeshPart]:
@@ -285,34 +325,9 @@ def write_obj_with_mtl(
         for v in part.vertices:
             all_vertices.append((v[0] * SCALE, v[1] * SCALE, v[2] * SCALE))
 
-        # Compute per-vertex normals by averaging face normals
-        vertex_normals = {}  # vertex_index -> list of normals
-        for i, face in enumerate(part.faces):
-            normal = part.normals[i] if i < len(part.normals) else (0, 0, 1)
-            for vi in face:
-                if vi not in vertex_normals:
-                    vertex_normals[vi] = []
-                vertex_normals[vi].append(normal)
-
-        # Average normals for each vertex
-        averaged_normals = []
-        for vi in range(len(part.vertices)):
-            if vi in vertex_normals:
-                normals = vertex_normals[vi]
-                avg_x = sum(n[0] for n in normals) / len(normals)
-                avg_y = sum(n[1] for n in normals) / len(normals)
-                avg_z = sum(n[2] for n in normals) / len(normals)
-                # Normalize
-                length = (avg_x**2 + avg_y**2 + avg_z**2) ** 0.5
-                if length > 0:
-                    averaged_normals.append((avg_x/length, avg_y/length, avg_z/length))
-                else:
-                    averaged_normals.append((0, 0, 1))
-            else:
-                averaged_normals.append((0, 0, 1))
-
-        # Add normals (one per vertex)
-        for n in averaged_normals:
+        # Normals are already per-vertex from extract_meshes_by_color
+        # Just use them directly
+        for n in part.normals:
             all_normals.append(n)
 
         # Add texture coordinates (one per vertex, dummy values)
@@ -489,9 +504,13 @@ def write_fbx_file(
                 polygon_indices.append(face[2] ^ -1)  # Last vertex negated and -1
 
             # Flatten normals
+            # Normals are now per-vertex in data["normals"]
             normals_flat = []
-            for n in part.normals:
-                normals_flat.extend([n[0], n[1], n[2]])
+            for face in part.faces:
+                # face is (v1_idx, v2_idx, v3_idx)
+                for v_idx in face:
+                    n = part.normals[v_idx]
+                    normals_flat.extend([n[0], n[1], n[2]])
 
             f.write(f'\tGeometry: {geom_id}, "Geometry::{part_name}", "Mesh" {{\n')
 
@@ -505,7 +524,7 @@ def write_fbx_file(
             f.write(",".join(str(i) for i in polygon_indices))
             f.write("\n\t\t}\n")
 
-            f.write('\t\tLayerElementNormal: 0 {\n')
+            f.write(f'\t\tLayerElementNormal: 0 {{\n')
             f.write('\t\t\tVersion: 102\n')
             f.write('\t\t\tName: "Normals"\n')
             f.write('\t\t\tMappingInformationType: "ByPolygon"\n')
