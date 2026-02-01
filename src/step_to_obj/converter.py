@@ -13,10 +13,10 @@ from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID, TopAbs_SHELL, TopAbs_COMPOUND,
 from OCP.TopLoc import TopLoc_Location
 from OCP.BRep import BRep_Tool
 from OCP.TopoDS import TopoDS, TopoDS_Iterator
-from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool, XCAFDoc_ColorSurf, XCAFDoc_ColorGen, XCAFDoc_ColorCurv
+from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool, XCAFDoc_ColorTool, XCAFDoc_ColorSurf, XCAFDoc_ColorGen, XCAFDoc_ColorCurv, XCAFDoc_Color
 from OCP.TDocStd import TDocStd_Document
 from OCP.TCollection import TCollection_ExtendedString
-from OCP.TDF import TDF_LabelSequence
+from OCP.TDF import TDF_LabelSequence, TDF_Label
 from OCP.Quantity import Quantity_Color, Quantity_TOC_RGB
 from OCP.GeomLProp import GeomLProp_SLProps
 from OCP.gp import gp_Pnt2d
@@ -85,11 +85,17 @@ def get_shape_color(shape, color_tool) -> tuple[float, float, float] | None:
 
 
 def get_label_color(label, color_tool) -> tuple[float, float, float] | None:
-    """Get color for a label by getting its shape first."""
-    shape = XCAFDoc_ShapeTool.GetShape_s(label)
-    if shape is None:
-        return None
-    return get_shape_color(shape, color_tool)
+    """Get color for a label directly."""
+    color = Quantity_Color()
+
+    # Try different color types on the LABEL directly
+    # Use static method GetColor_s which takes Label (instance method only takes Shape)
+    for color_type in [XCAFDoc_ColorSurf, XCAFDoc_ColorGen, XCAFDoc_ColorCurv]:
+        # signature: static GetColor_s(L: Label, type: Type, C: Color) -> bool
+        if XCAFDoc_ColorTool.GetColor_s(label, color_type, color):
+            return (color.Red(), color.Green(), color.Blue())
+            
+    return None
 
 
 def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float, float] | None, name_prefix: str) -> list[MeshPart]:
@@ -202,36 +208,78 @@ def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float,
     return result_parts
 
 
-def process_shape_recursive(shape, color_tool, shape_tool, parts: list[MeshPart], parent_color=None, name_prefix="Part"):
-    """Recursively process shapes and extract meshes with colors."""
-    # Get color for this shape
-    color = get_shape_color(shape, color_tool)
+def process_label_recursive(label, color_tool, shape_tool, parts: list[MeshPart], parent_color=None, parent_loc=None, name_prefix="Part"):
+    """Recursively process XCAF labels to handle Assembly colors correctly."""
+    # DEBUG: Verify strict static method usage
+    # print(f"DEBUG: Processing label {name_prefix}")
+    
+    if parent_loc is None:
+        parent_loc = TopLoc_Location()
+
+    # 1. Resolve Color
+    # Use label color if present, else inherit parent
+    color = get_label_color(label, color_tool)
     if color is None:
         color = parent_color
 
-    shape_type = shape.ShapeType()
+    # 2. Resolve Location and Target
+    # Get location of this node (relative to parent)
+    local_loc = XCAFDoc_ShapeTool.GetLocation_s(label)
+    
+    # Calculate accumulated location for passing to children
+    # Note: OCP Location multiplication is usually parent * child
+    new_parent_loc = parent_loc * local_loc
 
-    if shape_type in [TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE]:
-        # This is a solid/shell/face - extract mesh (now handles multiple colors)
-        new_parts = extract_meshes_by_color(shape, color_tool, color, f"{name_prefix}_{len(parts)}")
-        parts.extend(new_parts)
-    elif shape_type == TopAbs_COMPOUND:
-        # Compound - iterate children
-        from OCP.TopoDS import TopoDS_Iterator
-        it = TopoDS_Iterator(shape)
-        idx = 0
-        while it.More():
-            child = it.Value()
-            process_shape_recursive(child, color_tool, shape_tool, parts, color, f"{name_prefix}_{idx}")
-            it.Next()
-            idx += 1
+    # Resolve reference (Component -> Part/Assembly)
+    target_label = TDF_Label()
+    has_ref = XCAFDoc_ShapeTool.GetReferredShape_s(label, target_label)
+    if not has_ref or target_label.IsNull():
+        target_label = label
+
+    # 2. Resolve Color (Fallback to Prototype/Target)
+    if color is None:
+        # Check if the referred shape (prototype) has a color
+        if not target_label.IsEqual(label):
+             color = get_label_color(target_label, color_tool)
+
+    # 3. Inherit Parent Color
+    if color is None:
+        color = parent_color
+
+    # Check if Assembly
+    if XCAFDoc_ShapeTool.IsAssembly_s(target_label):
+        # Iterate components
+        comps = TDF_LabelSequence()
+        XCAFDoc_ShapeTool.GetComponents_s(target_label, comps)
+        
+        for i in range(1, comps.Length() + 1):
+            child_label = comps.Value(i)
+            process_label_recursive(
+                child_label, 
+                color_tool, 
+                shape_tool, 
+                parts, 
+                color, 
+                new_parent_loc, 
+                f"{name_prefix}_{i}"
+            )
     else:
-        # Try to extract mesh anyway
-        new_parts = extract_meshes_by_color(shape, color_tool, color, f"{name_prefix}_{len(parts)}")
-        parts.extend(new_parts)
+        # Leaf (Simple Shape)
+        # Get the shape from the label (this includes local_loc)
+        shape = XCAFDoc_ShapeTool.GetShape_s(label)
+        
+        if shape is not None:
+            # Apply the accumulated parent location
+            # shape has 'local_loc'. we need 'parent_loc * local_loc'.
+            # shape.Moved(parent_loc) applies parent_loc on top.
+            final_shape = shape.Moved(parent_loc)
+            
+            # Extract mesh (supports multiple colors within the shape if any)
+            new_parts = extract_meshes_by_color(final_shape, color_tool, color, f"{name_prefix}_{len(parts)}")
+            parts.extend(new_parts)
 
 
-def extract_all_meshes(doc, shape_tool, color_tool, linear_deflection: float = 1.0, angular_deflection: float = 0.1) -> list[MeshPart]:
+def extract_all_meshes(doc, shape_tool, color_tool, linear_deflection: float = 0.01, angular_deflection: float = 0.1) -> list[MeshPart]:
     """Extract all meshes with colors from the document."""
     parts = []
 
@@ -243,20 +291,21 @@ def extract_all_meshes(doc, shape_tool, color_tool, linear_deflection: float = 1
 
     for i in range(1, labels.Length() + 1):
         label = labels.Value(i)
+        
+        # 1. Mesh the geometry first (using the Shape)
+        # This ensures all sub-shapes have triangulation
         shape = XCAFDoc_ShapeTool.GetShape_s(label)
-
         if shape is None:
             continue
-
+            
         # Tessellate the shape
         mesh = BRepMesh_IncrementalMesh(shape, linear_deflection, False, angular_deflection, True)
         mesh.Perform()
-
-        # Get color from label
-        color = get_label_color(label, color_tool)
-
-        # Process shape recursively
-        process_shape_recursive(shape, color_tool, shape_tool, parts, color, f"Shape{i}")
+        
+        # 2. Traverse attributes (Color, Structure) using Labels
+        # Reset location for root
+        identity_loc = TopLoc_Location()
+        process_label_recursive(label, color_tool, shape_tool, parts, None, identity_loc, f"Shape{i}")
 
     return parts
 
@@ -399,7 +448,8 @@ def write_fbx_file(
             unique_colors[part.color] = len(unique_colors)
 
     # Default gray color if no colors
-    default_color = (0.75, 0.75, 0.75)
+    # Brighter default
+    default_color = (0.85, 0.85, 0.85)
     if default_color not in unique_colors:
         unique_colors[default_color] = len(unique_colors)
 
@@ -527,7 +577,7 @@ def write_fbx_file(
             f.write(f'\t\tLayerElementNormal: 0 {{\n')
             f.write('\t\t\tVersion: 102\n')
             f.write('\t\t\tName: "Normals"\n')
-            f.write('\t\t\tMappingInformationType: "ByPolygon"\n')
+            f.write('\t\t\tMappingInformationType: "ByPolygonVertex"\n')
             f.write('\t\t\tReferenceInformationType: "Direct"\n')
             f.write(f"\t\t\tNormals: *{len(normals_flat)} {{\n")
             f.write("\t\t\t\ta: ")
@@ -535,10 +585,24 @@ def write_fbx_file(
             f.write("\n\t\t\t}\n")
             f.write('\t\t}\n')
 
+            f.write(f'\t\tLayerElementMaterial: 0 {{\n')
+            f.write('\t\t\tVersion: 101\n')
+            f.write('\t\t\tName: "Materials"\n')
+            f.write('\t\t\tMappingInformationType: "AllSame"\n')
+            f.write('\t\t\tReferenceInformationType: "IndexToDirect"\n')
+            f.write('\t\t\tMaterials: *1 {\n')
+            f.write('\t\t\t\ta: 0\n')
+            f.write('\t\t\t}\n')
+            f.write('\t\t}\n')
+
             f.write('\t\tLayer: 0 {\n')
             f.write('\t\t\tVersion: 100\n')
             f.write('\t\t\tLayerElement:  {\n')
             f.write('\t\t\t\tType: "LayerElementNormal"\n')
+            f.write('\t\t\t\tTypedIndex: 0\n')
+            f.write('\t\t\t}\n')
+            f.write('\t\t\tLayerElement:  {\n')
+            f.write('\t\t\t\tType: "LayerElementMaterial"\n')
             f.write('\t\t\t\tTypedIndex: 0\n')
             f.write('\t\t\t}\n')
             f.write('\t\t}\n')
@@ -567,11 +631,15 @@ def write_fbx_file(
 
             f.write(f'\tMaterial: {mat_id}, "Material::{mat_name}", "" {{\n')
             f.write('\t\tVersion: 102\n')
-            f.write('\t\tShadingModel: "lambert"\n')
+            f.write('\t\tShadingModel: "phong"\n')
             f.write('\t\tMultiLayer: 0\n')
             f.write('\t\tProperties70:  {\n')
             f.write(f'\t\t\tP: "DiffuseColor", "Color", "", "A",{r:.6f},{g:.6f},{b:.6f}\n')
             f.write(f'\t\t\tP: "Diffuse", "Vector3D", "Vector", "",{r:.6f},{g:.6f},{b:.6f}\n')
+            # Add Ambient/Specular for brighter look
+            f.write(f'\t\t\tP: "AmbientColor", "Color", "", "A",0.5,0.5,0.5\n')
+            f.write(f'\t\t\tP: "SpecularColor", "Color", "", "A",0.4,0.4,0.4\n')
+            f.write(f'\t\t\tP: "Shininess", "double", "Number", "",16.0\n')
             f.write('\t\t}\n')
             f.write("\t}\n")
 
