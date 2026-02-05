@@ -99,10 +99,9 @@ def get_label_color(label, color_tool) -> tuple[float, float, float] | None:
 
 
 def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float, float] | None, name_prefix: str) -> list[MeshPart]:
-    """Extract mesh data from a shape, splitting by face colors."""
-    # Map color -> (vertices, faces, normals)
-    # We need to keep vertices separate per color group to avoid complex re-indexing
-    parts_data = {}  # color -> {vertices, faces, normals, current_index}
+    """Extract mesh data from a shape, splitting by face colors, with vertex deduplication."""
+    # Map color -> {vertices, faces, normals, unique_map}
+    parts_data = {}
 
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
 
@@ -122,12 +121,11 @@ def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float,
                 "vertices": [],
                 "faces": [],
                 "normals": [],
-                "current_index": 0
+                "unique_map": {}  # (x,y,z, nx,ny,nz) -> index
             }
             
         data = parts_data[color_key]
         
-
         location = TopLoc_Location()
         triangulation = BRep_Tool.Triangulation_s(topo_face, location)
 
@@ -139,19 +137,19 @@ def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float,
 
             transform = location.Transformation()
             
-            # Start index for this face in the current color group
-            face_vertex_start = data["current_index"]
+            # Temporary map for this face to map node_index -> global_index
+            # This is needed because triangles invoke nodes by 1-based index local to the triangulation
+            local_node_map = {} 
             
-            # Add vertices and normals
+            # Process vertices
             for i in range(1, triangulation.NbNodes() + 1):
                 node = triangulation.Node(i)
                 transformed = node.Transformed(transform)
-                vertex = (transformed.X(), transformed.Y(), transformed.Z())
-                data["vertices"].append(vertex)
-                data["current_index"] += 1
+                vx, vy, vz = transformed.X(), transformed.Y(), transformed.Z()
                 
-                # Calculate smooth normal if possible
-                normal = (0.0, 0.0, 1.0)
+                # Calculate smooth normal if possible, else default up
+                nx, ny, nz = 0.0, 0.0, 1.0
+                
                 if has_uv and surface:
                     uv = triangulation.UVNode(i)
                     props = GeomLProp_SLProps(surface, uv.X(), uv.Y(), 1, 1e-5)
@@ -159,34 +157,48 @@ def extract_meshes_by_color(shape, color_tool, parent_color: tuple[float, float,
                         n = props.Normal()
                         # Apply transformation
                         n_transformed = n.Transformed(transform) 
-                        
                         nx, ny, nz = n_transformed.X(), n_transformed.Y(), n_transformed.Z()
                         
                         # Flip if face is reversed
                         if face_reversed:
                             nx, ny, nz = -nx, -ny, -nz
                             
+                        # Normalize
                         length = (nx*nx + ny*ny + nz*nz) ** 0.5
-                        if length > 0:
-                            normal = (nx/length, ny/length, nz/length)
-                
-                data["normals"].append(normal)
+                        if length > 1e-9:
+                            nx, ny, nz = nx/length, ny/length, nz/length
 
-            # Add triangles (normals are already per-vertex now)
+                # Deduplication Key: Position + Normal
+                # Using 6 decimal places for deduplication tolerance
+                key = (
+                    round(vx, 6), round(vy, 6), round(vz, 6),
+                    round(nx, 6), round(ny, 6), round(nz, 6)
+                )
+
+                if key in data["unique_map"]:
+                    global_idx = data["unique_map"][key]
+                else:
+                    global_idx = len(data["vertices"])
+                    data["vertices"].append((vx, vy, vz))
+                    data["normals"].append((nx, ny, nz))
+                    data["unique_map"][key] = global_idx
+                
+                local_node_map[i] = global_idx
+
+            # Add triangles
             for i in range(1, triangulation.NbTriangles() + 1):
                 triangle = triangulation.Triangle(i)
                 n1, n2, n3 = triangle.Get()
 
-                v1_idx = face_vertex_start + n1 - 1
-                v2_idx = face_vertex_start + n2 - 1
-                v3_idx = face_vertex_start + n3 - 1
+                v1_idx = local_node_map[n1]
+                v2_idx = local_node_map[n2]
+                v3_idx = local_node_map[n3]
 
                 # Reverse winding order if face is reversed
                 if face_reversed:
                     data["faces"].append((v1_idx, v3_idx, v2_idx))
                 else:
                     data["faces"].append((v1_idx, v2_idx, v3_idx))
-
 
         explorer.Next()
 
@@ -541,26 +553,65 @@ def write_fbx_file(
             geom_id = GEOMETRY_BASE + part_idx
             part_name = part.name.replace(" ", "_")
 
-            # Flatten vertices
+            # --- Optimization: Positional Deduplication for Vertices ---
+            unique_pos_map = {} # (x,y,z) -> new_index
+            new_vertices = []
+            
+            # Map old_vertex_index -> new_vertex_index
+            old_to_new_v_map = [0] * len(part.vertices)
+            
+            for i, v in enumerate(part.vertices):
+                # Use 6 decimals for positional tolerance
+                key = (round(v[0], 6), round(v[1], 6), round(v[2], 6))
+                if key in unique_pos_map:
+                    old_to_new_v_map[i] = unique_pos_map[key]
+                else:
+                    idx = len(new_vertices)
+                    new_vertices.append(v)
+                    unique_pos_map[key] = idx
+                    old_to_new_v_map[i] = idx
+            
+            # Flatten new vertices
             vertices_flat = []
-            for v in part.vertices:
+            for v in new_vertices:
                 vertices_flat.extend([v[0], v[1], v[2]])
 
-            # Build polygon indices
+            # Build polygon indices utilizing the new vertex mapping
             polygon_indices = []
             for face in part.faces:
-                polygon_indices.append(face[0])
-                polygon_indices.append(face[1])
-                polygon_indices.append(face[2] ^ -1)  # Last vertex negated and -1
+                v1 = old_to_new_v_map[face[0]]
+                v2 = old_to_new_v_map[face[1]]
+                v3 = old_to_new_v_map[face[2]]
+                
+                polygon_indices.append(v1)
+                polygon_indices.append(v2)
+                polygon_indices.append(v3 ^ -1)  # Last vertex negated and -1
 
-            # Flatten normals
-            # Normals are now per-vertex in data["normals"]
-            normals_flat = []
+            # --- Optimization: Indexed Normals ---
+            # Gather unique key normals to compress data
+            unique_normal_map = {} # (nx,ny,nz) -> index
+            unique_normals_list = []
+            normal_indices_flat = []
+            
             for face in part.faces:
-                # face is (v1_idx, v2_idx, v3_idx)
                 for v_idx in face:
                     n = part.normals[v_idx]
-                    normals_flat.extend([n[0], n[1], n[2]])
+                    key = (round(n[0], 6), round(n[1], 6), round(n[2], 6))
+                    
+                    if key in unique_normal_map:
+                        idx = unique_normal_map[key]
+                    else:
+                        idx = len(unique_normals_list)
+                        unique_normals_list.append(n)
+                        unique_normal_map[key] = idx
+                    
+                    normal_indices_flat.append(idx)
+            
+            # Flatten unique normals
+            normals_flat_values = []
+            for n in unique_normals_list:
+                normals_flat_values.extend([n[0], n[1], n[2]])
+
 
             f.write(f'\tGeometry: {geom_id}, "Geometry::{part_name}", "Mesh" {{\n')
 
@@ -578,11 +629,18 @@ def write_fbx_file(
             f.write('\t\t\tVersion: 102\n')
             f.write('\t\t\tName: "Normals"\n')
             f.write('\t\t\tMappingInformationType: "ByPolygonVertex"\n')
-            f.write('\t\t\tReferenceInformationType: "Direct"\n')
-            f.write(f"\t\t\tNormals: *{len(normals_flat)} {{\n")
+            f.write('\t\t\tReferenceInformationType: "IndexToDirect"\n') 
+            
+            f.write(f"\t\t\tNormals: *{len(normals_flat_values)} {{\n")
             f.write("\t\t\t\ta: ")
-            f.write(",".join(f"{n:.6f}" for n in normals_flat))
+            f.write(",".join(f"{n:.6f}" for n in normals_flat_values))
             f.write("\n\t\t\t}\n")
+            
+            f.write(f"\t\t\tNormalsIndex: *{len(normal_indices_flat)} {{\n")
+            f.write("\t\t\t\ta: ")
+            f.write(",".join(str(i) for i in normal_indices_flat))
+            f.write("\n\t\t\t}\n")
+            
             f.write('\t\t}\n')
 
             f.write(f'\t\tLayerElementMaterial: 0 {{\n')
